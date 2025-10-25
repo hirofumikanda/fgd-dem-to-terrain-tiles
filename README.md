@@ -42,7 +42,6 @@ DEM10B ZIP → XML抽出 → GeoTIFF変換 → Web Mercator投影 → [分岐処
 ```bash
 pip install fgddem-py      # 基盤地図情報XML → GeoTIFF変換
 pip install rio-rgbify     # Terrain RGBエンコーディング
-pip install mbutil         # MBTiles操作
 ```
 
 ### 外部ツール
@@ -55,6 +54,9 @@ pip install mbutil         # MBTiles操作
 
 # PMTiles（タイル形式変換）
 # https://github.com/protomaps/go-pmtiles のインストール手順に従ってください
+
+# mbutil（MBTiles操作）
+# https://github.com/mapbox/mbutil のインストール手順に従ってください
 ```
 
 ## 使用方法
