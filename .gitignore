@@ -1,0 +1,13 @@
+.venv/
+logs/
+fgd/
+tiff/
+xml/
+tiles*
+*.tif
+*.geojson
+*.xml
+*.mbtiles
+*.pmtiles
+*.vrt
+*.txt
