@@ -36,7 +36,6 @@ DEM10B ZIP → XML抽出 → GeoTIFF変換 → Web Mercator投影 → [分岐処
 
 - Docker
 - Python 3.10以上
-- Node.js（tippecanoe用）
 
 ### 必要なPythonパッケージ
 
