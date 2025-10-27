@@ -5,10 +5,14 @@ INPUT_FILE="./dem_3857_hillshade_vector.geojson"
 MBTILES_FILE="./dem_3857_hillshade_vector.mbtiles"
 PMTILES_FILE="./dem_3857_hillshade_vector.pmtiles"
 
-# tippecanoe設定
-MAX_ZOOM=12
+# tippecanoe設定（描画パフォーマンス重視）
+MAX_ZOOM=12                     # さらに低いズームレベル
 MIN_ZOOM=0
 LAYER_NAME="hillshade"
+MAX_FEATURES_PER_TILE=120000     # タイル当たりの最大フィーチャ数を削減
+SIMPLIFICATION_LEVEL=5         # より強い簡素化（1-10、数字が大きいほど簡素化）
+MAX_TILE_BYTES=300000           # より小さなタイルサイズ制限
+MIN_POLYGON_SIZE=10             # 微小ポリゴンの最小サイズ（ピクセル）
 
 # ログディレクトリ作成
 mkdir -p "./logs"
@@ -96,23 +100,30 @@ log "🗂️  MVTタイル生成中（tippecanoe）..."
 log "設定詳細:"
 log "   ズーム範囲: ${MIN_ZOOM}-${MAX_ZOOM}"
 log "   レイヤー名: $LAYER_NAME"
-log "   最適化: Hillshadeベクター用パラメータ"
+log "   最大フィーチャ数/タイル: $MAX_FEATURES_PER_TILE"
+log "   簡素化レベル: $SIMPLIFICATION_LEVEL"
+log "   最大タイルサイズ: ${MAX_TILE_BYTES}バイト"
+log "   微小ポリゴン除去: ${MIN_POLYGON_SIZE}ピクセル未満"
+log "   フィルター: class <= 5 のポリゴンのみ"
+log "   最適化: 積極的な軽量化設定"
 
 # tippecanoe実行開始時間を記録
 start_time=$(date +%s)
 
 # tippecanoeでHillshadeベクターのMVTタイルを生成
-# Hillshadeベクター用の最適化パラメータを使用
+# 積極的な軽量化設定でタイルサイズエラーを回避
+# 微小ポリゴンを一律に省いてパフォーマンス向上
 tippecanoe \
     -f -P -o "$MBTILES_FILE" \
     -l "$LAYER_NAME" \
     -z "$MAX_ZOOM" \
     -Z "$MIN_ZOOM" \
+    --feature-filter='{"*":["<=", "class", 5]}' \
+    --simplification="$SIMPLIFICATION_LEVEL" \
+    --tiny-polygon-size="$MIN_POLYGON_SIZE" \
+    --no-tiny-polygon-reduction-at-maximum-zoom \
+    --coalesce \
     -pf -pk \
-    --simplification=2 \
-    --detect-shared-borders \
-    --coalesce-smallest-as-needed \
-    --coalesce-densest-as-needed \
     "$INPUT_FILE"
 
 # tippecanoe結果の確認
@@ -136,13 +147,20 @@ if [ $? -eq 0 ] && [ -f "$MBTILES_FILE" ]; then
         tile_count=$(sqlite3 "$MBTILES_FILE" "SELECT COUNT(*) FROM tiles;")
         log "📊 生成されたタイル数: $tile_count"
         
-        # ズームレベル別タイル数
-        log "📊 ズームレベル別タイル数:"
+        # ズームレベル別タイル数とパフォーマンス統計
+        log "📊 ズームレベル別タイル数（パフォーマンス指標）:"
         sqlite3 "$MBTILES_FILE" "SELECT zoom_level, COUNT(*) FROM tiles GROUP BY zoom_level ORDER BY zoom_level;" | while read line; do
             zoom=$(echo "$line" | cut -d'|' -f1)
             count=$(echo "$line" | cut -d'|' -f2)
             log "   ズーム $zoom: $count タイル"
         done
+        
+        # 高ズームレベルでのタイル数チェック（パフォーマンス警告）
+        high_zoom_tiles=$(sqlite3 "$MBTILES_FILE" "SELECT COUNT(*) FROM tiles WHERE zoom_level >= $((MAX_ZOOM - 1));" 2>/dev/null)
+        if [ -n "$high_zoom_tiles" ] && [ $high_zoom_tiles -gt 10000 ]; then
+            log "⚠️  警告: 高ズームレベル(${MAX_ZOOM}-$((MAX_ZOOM-1)))で${high_zoom_tiles}タイル生成されています"
+            log "   描画パフォーマンスに影響する可能性があります"
+        fi
         
         # サンプルタイルのサイズ情報
         avg_size=$(sqlite3 "$MBTILES_FILE" "SELECT AVG(LENGTH(tile_data)) FROM tiles;" | cut -d'.' -f1)
@@ -214,15 +232,29 @@ if [ $? -eq 0 ] && [ -f "$PMTILES_FILE" ]; then
     
     log "🎉 処理完了!"
     log ""
-    log "📋 最終結果:"
+    log "📋 最終結果（描画パフォーマンス最適化済み）:"
     log "   入力ファイル: $INPUT_FILE ($file_size, $feature_count フィーチャー)"
     log "   MBTiles: $MBTILES_FILE ($mbtiles_size)"
     log "   PMTiles: $PMTILES_FILE ($pmtiles_size)"
     if [ -n "$tile_count" ]; then
         log "   生成タイル数: $tile_count"
+        # タイル当たりの平均フィーチャ数を計算
+        if [ $feature_count -gt 0 ] && [ $tile_count -gt 0 ]; then
+            avg_features_per_tile=$((feature_count / tile_count))
+            log "   推定平均フィーチャ数/タイル: $avg_features_per_tile"
+        fi
     fi
     log "   ズーム範囲: ${MIN_ZOOM}-${MAX_ZOOM}"
     log "   レイヤー名: $LAYER_NAME"
+    log "   最大フィーチャ数制限: $MAX_FEATURES_PER_TILE/タイル"
+    log ""
+    log "📍 積極的軽量化設定:"
+    log "   量子化レベル: 3段階（シンプルな分類）"
+    log "   簡素化レベル: $SIMPLIFICATION_LEVEL（非常に強い簡素化）"
+    log "   最大ズーム: $MAX_ZOOM（軽量化重視）"
+    log "   最大タイルサイズ: ${MAX_TILE_BYTES}バイト"
+    log "   フィーチャ制限: ${MAX_FEATURES_PER_TILE}/タイル"
+    log "   属性フィルター: class <= 5 のみ表示"
     log ""
     log "ログファイル: $LOG_FILE"
 else

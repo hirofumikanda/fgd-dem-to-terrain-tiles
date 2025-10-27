@@ -7,7 +7,7 @@ QUANTIZED_FILE="./dem_3857_hillshade_quantized.tif"
 VECTOR_FILE="./dem_3857_hillshade_vector.geojson"
 
 # 量子化設定（変更可能）
-QUANTIZATION_LEVELS=5  # 256段階を5段階に量子化（変更可能）
+QUANTIZATION_LEVELS=8  # 256段階を8段階に量子化（描画パフォーマンス重視）
 
 # ログディレクトリ作成
 mkdir -p "./logs"
