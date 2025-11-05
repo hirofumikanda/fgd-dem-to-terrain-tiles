@@ -108,40 +108,45 @@ fi
 
 log "✅ テキストタイル生成スクリプトを確認しました: $PYTHON_SCRIPT"
 
-# Pythonコンテナでテキストタイル生成を実行
-log "🗺️  テキストタイル生成中..."
+# ピラミッド方式でテキストタイル生成を実行
+log "🗺️  ピラミッド方式でテキストタイル生成中..."
 log "ズームレベル ${MIN_ZOOM} から ${MAX_ZOOM} まで処理します"
+log "🔥 効率化: z${MAX_ZOOM}から開始してリサンプリングでピラミッド構築"
 
-docker run --rm -v "$PWD":/work -w /work ghcr.io/osgeo/gdal:alpine-normal-latest sh -c "
-python3 $PYTHON_SCRIPT '$CLEANED_FILE' '$OUTPUT_DIR' $MIN_ZOOM $MAX_ZOOM $TILE_SIZE
-"
+docker run --rm \
+    -v "$PWD":/work \
+    -w /work \
+    ghcr.io/osgeo/gdal:alpine-normal-latest \
+    sh -c "
+    apk add --no-cache python3 py3-pip py3-numpy py3-scipy && \
+    python3 $PYTHON_SCRIPT '$CLEANED_FILE' '$OUTPUT_DIR' $MIN_ZOOM $MAX_ZOOM $TILE_SIZE
+    "
 
 # 生成結果の確認
 if [ $? -eq 0 ]; then
-    log "✅ テキストタイル生成成功"
+    log "✅ ピラミッド方式テキストタイル生成成功"
     
-    # 生成されたタイル数を確認
+    # 各ズームレベルのタイル数を確認
+    log "📊 ズームレベル別タイル数:"
+    for zoom in $(seq $MIN_ZOOM $MAX_ZOOM); do
+        if [ -d "$OUTPUT_DIR/$zoom" ]; then
+            zoom_tiles=$(find "$OUTPUT_DIR/$zoom" -name "*.txt" 2>/dev/null | wc -l)
+            log "   z$zoom: $zoom_tiles タイル"
+        fi
+    done
+    
+    # 全体のタイル数を確認
     total_tiles=$(find "$OUTPUT_DIR" -name "*.txt" | wc -l)
-    log "📊 生成タイル数: $total_tiles"
+    log "📊 総生成タイル数: $total_tiles"
     
     # ディレクトリサイズを表示
     dir_size=$(du -sh "$OUTPUT_DIR" | cut -f1)
     log "📊 出力ディレクトリサイズ: $dir_size"
     
-    # サンプルタイルの内容を確認
-    sample_tile=$(find "$OUTPUT_DIR" -name "*.txt" | head -1)
-    if [ -n "$sample_tile" ]; then
-        log "📄 サンプルタイル: $sample_tile"
-        value_count=$(head -c 200 "$sample_tile" | tr ',' '\n' | wc -l)
-        log "   先頭200文字の値数: $value_count"
-        first_values=$(head -c 100 "$sample_tile")
-        log "   先頭の値: $first_values..."
-    fi
-    
-    log "🎉 処理完了!"
+    log "🎉 ピラミッド方式処理完了!"
     log "ログファイル: $LOG_FILE"
     
 else
-    log "❌ エラー: テキストタイル生成に失敗しました"
+    log "❌ エラー: ピラミッド方式テキストタイル生成に失敗しました"
     exit 1
 fi
