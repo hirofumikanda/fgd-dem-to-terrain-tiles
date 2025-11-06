@@ -4,6 +4,10 @@ import sys
 import math
 import numpy as np
 from scipy import ndimage
+from multiprocessing import Pool, cpu_count
+from functools import partial
+import time
+import csv
 
 # Try to import GDAL, fallback if not available
 try:
@@ -12,6 +16,39 @@ try:
 except ImportError:
     HAS_GDAL = False
     print("Warning: GDAL not available, some functions may not work")
+
+def load_target_tiles(csv_file):
+    """CSVファイルから対象タイルIDを読み込み"""
+    target_tiles = {}  # {zoom: set((x, y))}
+    
+    if not os.path.exists(csv_file):
+        print(f"Warning: Target tiles CSV file not found: {csv_file}")
+        return None
+    
+    try:
+        with open(csv_file, 'r') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                z = int(row['z'])
+                x = int(row['x'])
+                y = int(row['y'])
+                
+                if z not in target_tiles:
+                    target_tiles[z] = set()
+                target_tiles[z].add((x, y))
+        
+        # 統計情報を表示
+        total_tiles = sum(len(tiles) for tiles in target_tiles.values())
+        print(f"📄 Loaded target tiles from {csv_file}")
+        print(f"   Total target tiles: {total_tiles}")
+        for zoom in sorted(target_tiles.keys()):
+            print(f"   z{zoom}: {len(target_tiles[zoom])} tiles")
+        
+        return target_tiles
+        
+    except Exception as e:
+        print(f"Error loading target tiles CSV: {e}")
+        return None
 
 def deg2num(lat_deg, lon_deg, zoom):
     """緯度経度をタイル座標に変換"""
@@ -127,12 +164,25 @@ def downsample_tile(parent_tiles, tile_size):
     
     return downsampled
 
-def generate_text_tiles(input_file, output_dir, min_zoom, max_zoom, tile_size):
+def generate_text_tiles(input_file, output_dir, min_zoom, max_zoom, tile_size, num_processes=None, target_tiles_csv=None):
     """テキストタイルを生成（ピラミッド方式：z14から開始してリサンプリング）"""
     if not HAS_GDAL:
         print("Error: GDAL is required for this function")
         return False
-        
+    
+    if num_processes is None:
+        num_processes = min(cpu_count(), 8)  # 最大8プロセス
+    
+    # 対象タイルの読み込み
+    target_tiles = None
+    if target_tiles_csv:
+        target_tiles = load_target_tiles(target_tiles_csv)
+        if target_tiles is None:
+            print("Warning: Failed to load target tiles, proceeding with full tile generation")
+    
+    print(f"🚀 Starting text tile generation with {num_processes} processes")
+    if target_tiles:
+        print(f"🎯 Using target tiles from: {target_tiles_csv}")
     print(f"Opening raster: {input_file}")
     dataset = gdal.Open(input_file, gdal.GA_ReadOnly)
     if not dataset:
@@ -168,151 +218,242 @@ def generate_text_tiles(input_file, output_dir, min_zoom, max_zoom, tile_size):
     print(f"Raster bounds (WGS84): {min_lat}, {min_lon}, {max_lat}, {max_lon}")
     
     total_tiles = 0
+    total_start_time = time.time()
     
     # Step 1: 最高解像度（max_zoom、通常z14）のタイルを生成
     print(f"🚀 Generating base tiles at zoom level {max_zoom}")
+    base_start_time = time.time()
     base_zoom_tiles = generate_base_zoom_tiles(
         dataset, band, geotransform, nodata_value,
         minx, miny, maxx, maxy, min_lat, min_lon, max_lat, max_lon,
-        max_zoom, tile_size, output_dir
+        max_zoom, tile_size, output_dir, num_processes, target_tiles
     )
+    base_end_time = time.time()
     total_tiles += base_zoom_tiles
-    print(f"✅ Generated {base_zoom_tiles} base tiles at zoom {max_zoom}")
+    print(f"✅ Generated {base_zoom_tiles} base tiles at zoom {max_zoom} in {base_end_time - base_start_time:.1f}s")
     
     # Step 2: ピラミッド生成（max_zoom-1からmin_zoomまで）
     for zoom in range(max_zoom - 1, min_zoom - 1, -1):
         print(f"🔄 Generating zoom level {zoom} from zoom {zoom + 1}")
-        pyramid_tiles = generate_pyramid_level(output_dir, zoom, zoom + 1, tile_size)
+        pyramid_start_time = time.time()
+        pyramid_tiles = generate_pyramid_level(output_dir, zoom, zoom + 1, tile_size, target_tiles)
+        pyramid_end_time = time.time()
         total_tiles += pyramid_tiles
-        print(f"✅ Generated {pyramid_tiles} tiles for zoom {zoom}")
+        print(f"✅ Generated {pyramid_tiles} tiles for zoom {zoom} in {pyramid_end_time - pyramid_start_time:.1f}s")
     
-    print(f"🎉 Total tiles generated: {total_tiles}")
+    total_end_time = time.time()
+    total_time = total_end_time - total_start_time
+    
+    print(f"🎉 Total tiles generated: {total_tiles} in {total_time:.1f}s")
+    print(f"📊 Average processing speed: {total_tiles / total_time:.1f} tiles/second")
     dataset = None
     return True
 
+def generate_single_base_tile(args):
+    """単一のベースタイルを生成（マルチプロセッシング用）"""
+    (tx, ty, zoom, tile_size, input_file, output_dir, 
+     geotransform, nodata_value, minx, miny, maxx, maxy) = args
+    
+    try:
+        # GDALデータセットを再オープン
+        dataset = gdal.Open(input_file, gdal.GA_ReadOnly)
+        if not dataset:
+            return (tx, ty, False, "Could not open dataset")
+        
+        band = dataset.GetRasterBand(1)
+        
+        # タイルの地理的範囲を計算（WGS84）
+        north, west = num2deg(tx, ty, zoom)
+        south, east = num2deg(tx + 1, ty + 1, zoom)
+        
+        # WGS84からWeb Mercatorに変換
+        def wgs84_to_webmercator(lat, lon):
+            x = lon * 20037508.342789244 / 180.0
+            y = math.log(math.tan((90.0 + lat) * math.pi / 360.0)) * 20037508.342789244 / math.pi
+            return x, y
+        
+        tile_west_merc, tile_north_merc = wgs84_to_webmercator(north, west)
+        tile_east_merc, tile_south_merc = wgs84_to_webmercator(south, east)
+        
+        # タイルとラスターの重複領域を計算
+        overlap_minx = max(tile_west_merc, minx)
+        overlap_maxx = min(tile_east_merc, maxx)
+        overlap_miny = max(tile_south_merc, miny)
+        overlap_maxy = min(tile_north_merc, maxy)
+        
+        # 重複がない場合はスキップ
+        if overlap_minx >= overlap_maxx or overlap_miny >= overlap_maxy:
+            dataset = None
+            return (tx, ty, False, "No overlap")
+        
+        # ラスター座標系での範囲を計算
+        pixel_minx = max(0, int((overlap_minx - geotransform[0]) / geotransform[1]))
+        pixel_maxx = min(dataset.RasterXSize, int((overlap_maxx - geotransform[0]) / geotransform[1]) + 1)
+        pixel_miny = max(0, int((overlap_maxy - geotransform[3]) / geotransform[5]))
+        pixel_maxy = min(dataset.RasterYSize, int((overlap_miny - geotransform[3]) / geotransform[5]) + 1)
+        
+        if pixel_minx >= pixel_maxx or pixel_miny >= pixel_maxy:
+            dataset = None
+            return (tx, ty, False, "Invalid pixel range")
+        
+        # ラスターデータを読み込み
+        width = pixel_maxx - pixel_minx
+        height = pixel_maxy - pixel_miny
+        
+        if width <= 0 or height <= 0:
+            dataset = None
+            return (tx, ty, False, "Invalid dimensions")
+        
+        data = band.ReadAsArray(pixel_minx, pixel_miny, width, height)
+        
+        if data is None:
+            dataset = None
+            return (tx, ty, False, "Could not read data")
+        
+        # データをfloat型に変換
+        data = data.astype(np.float32)
+        
+        # NaNや無効値を処理
+        if nodata_value is not None:
+            data = np.where(data == nodata_value, np.nan, data)
+        
+        # タイル内でのグリッドポイントを生成
+        elevation_grid = np.full((tile_size, tile_size), np.nan, dtype=np.float32)
+        
+        for i in range(tile_size):
+            for j in range(tile_size):
+                # グリッドポイントの地理的座標（WGS84）
+                point_lat = north - (north - south) * i / (tile_size - 1)
+                point_lon = west + (east - west) * j / (tile_size - 1)
+                
+                # Web Mercator座標に変換
+                point_x, point_y = wgs84_to_webmercator(point_lat, point_lon)
+                
+                # ラスター座標系に変換
+                raster_x = (point_x - geotransform[0]) / geotransform[1]
+                raster_y = (point_y - geotransform[3]) / geotransform[5]
+                
+                # ラスター範囲内かチェック
+                if (pixel_minx <= raster_x < pixel_maxx and 
+                    pixel_miny <= raster_y < pixel_maxy):
+                    
+                    # ローカル座標に変換（bilinear補間用）
+                    local_x = raster_x - pixel_minx
+                    local_y = raster_y - pixel_miny
+                    
+                    # Bilinear補間を実行
+                    value = bilinear_interpolation(data, local_x, local_y, width, height)
+                    if not np.isnan(value):
+                        elevation_grid[i, j] = value
+        
+        # NaNを0に変換
+        elevation_grid = np.where(np.isnan(elevation_grid), 0.0, elevation_grid)
+        
+        # 全面0.00の場合はタイル出力をスキップ
+        if np.all(elevation_grid == 0.0):
+            dataset = None
+            return (tx, ty, False, "All zeros")
+        
+        # テキストファイルに保存
+        x_dir = os.path.join(output_dir, str(zoom), str(tx))
+        os.makedirs(x_dir, exist_ok=True)
+        tile_file = os.path.join(x_dir, f"{ty}.txt")
+        save_tile_data(elevation_grid, tile_file)
+        
+        dataset = None
+        return (tx, ty, True, "Success")
+        
+    except Exception as e:
+        return (tx, ty, False, f"Error: {str(e)}")
+
 def generate_base_zoom_tiles(dataset, band, geotransform, nodata_value,
                            minx, miny, maxx, maxy, min_lat, min_lon, max_lat, max_lon,
-                           zoom, tile_size, output_dir):
-    """最高解像度のタイルを元データから生成"""
+                           zoom, tile_size, output_dir, num_processes=None, target_tiles=None):
+    """最高解像度のタイルを元データから並列処理で生成"""
     
-    # このズームレベルでのタイル範囲を計算
-    min_tile_x, max_tile_y = deg2num(min_lat, min_lon, zoom)
-    max_tile_x, min_tile_y = deg2num(max_lat, max_lon, zoom)
+    if num_processes is None:
+        num_processes = min(cpu_count(), 8)  # 最大8プロセス
     
-    # タイル範囲を調整
-    min_tile_x = max(0, min_tile_x)
-    max_tile_x = min(2**zoom - 1, max_tile_x)
-    min_tile_y = max(0, min_tile_y)
-    max_tile_y = min(2**zoom - 1, max_tile_y)
+    print(f"  Using {num_processes} processes for parallel tile generation")
     
-    print(f"  Tile range: x={min_tile_x}-{max_tile_x}, y={min_tile_y}-{max_tile_y}")
+    # 対象タイルが指定されている場合はそれを使用
+    if target_tiles and zoom in target_tiles:
+        tile_coords = list(target_tiles[zoom])
+        print(f"  Using target tiles from CSV: {len(tile_coords)} tiles at zoom {zoom}")
+    else:
+        # このズームレベルでのタイル範囲を計算
+        min_tile_x, max_tile_y = deg2num(min_lat, min_lon, zoom)
+        max_tile_x, min_tile_y = deg2num(max_lat, max_lon, zoom)
+        
+        # タイル範囲を調整
+        min_tile_x = max(0, min_tile_x)
+        max_tile_x = min(2**zoom - 1, max_tile_x)
+        min_tile_y = max(0, min_tile_y)
+        max_tile_y = min(2**zoom - 1, max_tile_y)
+        
+        print(f"  Tile range: x={min_tile_x}-{max_tile_x}, y={min_tile_y}-{max_tile_y}")
+        
+        # 全タイル座標のリストを生成
+        tile_coords = []
+        for tx in range(min_tile_x, max_tile_x + 1):
+            for ty in range(min_tile_y, max_tile_y + 1):
+                tile_coords.append((tx, ty))
     
     zoom_dir = os.path.join(output_dir, str(zoom))
     os.makedirs(zoom_dir, exist_ok=True)
     
-    zoom_tiles = 0
+    # 全タイルのタスクリストを作成
+    tasks = []
+    for tx, ty in tile_coords:
+        task = (tx, ty, zoom, tile_size, dataset.GetDescription(), output_dir,
+               geotransform, nodata_value, minx, miny, maxx, maxy)
+        tasks.append(task)
     
-    for tx in range(min_tile_x, max_tile_x + 1):
-        x_dir = os.path.join(zoom_dir, str(tx))
-        os.makedirs(x_dir, exist_ok=True)
+    total_tasks = len(tasks)
+    print(f"  Processing {total_tasks} tiles...")
+    
+    successful_tiles = 0
+    failed_tiles = 0
+    skipped_tiles = 0
+    
+    start_time = time.time()
+    
+    # 並列処理でタイル生成
+    with Pool(processes=num_processes) as pool:
+        # 進捗表示のためチャンクサイズを調整
+        chunk_size = max(1, total_tasks // (num_processes * 4))
         
-        for ty in range(min_tile_y, max_tile_y + 1):
-            # タイルの地理的範囲を計算（WGS84）
-            north, west = num2deg(tx, ty, zoom)
-            south, east = num2deg(tx + 1, ty + 1, zoom)
+        results = pool.map(generate_single_base_tile, tasks, chunksize=chunk_size)
+        
+        # 結果を処理
+        for i, (tx, ty, success, message) in enumerate(results):
+            if success:
+                successful_tiles += 1
+            elif message == "No overlap" or message == "All zeros":
+                skipped_tiles += 1
+            else:
+                failed_tiles += 1
+                if failed_tiles <= 10:  # 最初の10個のエラーのみ表示
+                    print(f"    Failed tile {tx}/{ty}: {message}")
             
-            # WGS84からWeb Mercatorに変換
-            def wgs84_to_webmercator(lat, lon):
-                x = lon * 20037508.342789244 / 180.0
-                y = math.log(math.tan((90.0 + lat) * math.pi / 360.0)) * 20037508.342789244 / math.pi
-                return x, y
-            
-            tile_west_merc, tile_north_merc = wgs84_to_webmercator(north, west)
-            tile_east_merc, tile_south_merc = wgs84_to_webmercator(south, east)
-            
-            # タイルとラスターの重複領域を計算
-            overlap_minx = max(tile_west_merc, minx)
-            overlap_maxx = min(tile_east_merc, maxx)
-            overlap_miny = max(tile_south_merc, miny)
-            overlap_maxy = min(tile_north_merc, maxy)
-            
-            # 重複がない場合はスキップ
-            if overlap_minx >= overlap_maxx or overlap_miny >= overlap_maxy:
-                continue
-            
-            # ラスター座標系での範囲を計算
-            pixel_minx = max(0, int((overlap_minx - geotransform[0]) / geotransform[1]))
-            pixel_maxx = min(dataset.RasterXSize, int((overlap_maxx - geotransform[0]) / geotransform[1]) + 1)
-            pixel_miny = max(0, int((overlap_maxy - geotransform[3]) / geotransform[5]))
-            pixel_maxy = min(dataset.RasterYSize, int((overlap_miny - geotransform[3]) / geotransform[5]) + 1)
-            
-            if pixel_minx >= pixel_maxx or pixel_miny >= pixel_maxy:
-                continue
-            
-            # ラスターデータを読み込み
-            width = pixel_maxx - pixel_minx
-            height = pixel_maxy - pixel_miny
-            
-            if width <= 0 or height <= 0:
-                continue
-            
-            data = band.ReadAsArray(pixel_minx, pixel_miny, width, height)
-            
-            if data is None:
-                continue
-            
-            # データをfloat型に変換
-            data = data.astype(np.float32)
-            
-            # NaNや無効値を処理
-            if nodata_value is not None:
-                data = np.where(data == nodata_value, np.nan, data)
-            
-            # タイル内でのグリッドポイントを生成
-            elevation_grid = np.full((tile_size, tile_size), np.nan, dtype=np.float32)
-            
-            for i in range(tile_size):
-                for j in range(tile_size):
-                    # グリッドポイントの地理的座標（WGS84）
-                    point_lat = north - (north - south) * i / (tile_size - 1)
-                    point_lon = west + (east - west) * j / (tile_size - 1)
-                    
-                    # Web Mercator座標に変換
-                    point_x, point_y = wgs84_to_webmercator(point_lat, point_lon)
-                    
-                    # ラスター座標系に変換
-                    raster_x = (point_x - geotransform[0]) / geotransform[1]
-                    raster_y = (point_y - geotransform[3]) / geotransform[5]
-                    
-                    # ラスター範囲内かチェック
-                    if (pixel_minx <= raster_x < pixel_maxx and 
-                        pixel_miny <= raster_y < pixel_maxy):
-                        
-                        # ローカル座標に変換（bilinear補間用）
-                        local_x = raster_x - pixel_minx
-                        local_y = raster_y - pixel_miny
-                        
-                        # Bilinear補間を実行
-                        value = bilinear_interpolation(data, local_x, local_y, width, height)
-                        if not np.isnan(value):
-                            elevation_grid[i, j] = value
-            
-            # NaNを0に変換
-            elevation_grid = np.where(np.isnan(elevation_grid), 0.0, elevation_grid)
-            
-            # 全面0.00の場合はタイル出力をスキップ
-            if np.all(elevation_grid == 0.0):
-                continue
-            
-            # テキストファイルに保存
-            tile_file = os.path.join(x_dir, f"{ty}.txt")
-            save_tile_data(elevation_grid, tile_file)
-            
-            zoom_tiles += 1
+            # 進捗表示（100タイルごと）
+            if (i + 1) % 100 == 0 or i + 1 == total_tasks:
+                elapsed = time.time() - start_time
+                progress = (i + 1) / total_tasks * 100
+                eta = elapsed / (i + 1) * (total_tasks - i - 1) if i > 0 else 0
+                print(f"    Progress: {i+1}/{total_tasks} ({progress:.1f}%) - "
+                      f"Success: {successful_tiles}, Skipped: {skipped_tiles}, Failed: {failed_tiles} - "
+                      f"ETA: {eta:.1f}s")
     
-    return zoom_tiles
+    end_time = time.time()
+    total_time = end_time - start_time
+    
+    print(f"  Completed in {total_time:.1f}s")
+    print(f"  Results: {successful_tiles} successful, {skipped_tiles} skipped, {failed_tiles} failed")
+    
+    return successful_tiles
 
-def generate_pyramid_level(output_dir, target_zoom, source_zoom, tile_size):
+def generate_pyramid_level(output_dir, target_zoom, source_zoom, tile_size, target_tiles=None):
     """親ズームレベルから子ズームレベルのタイルをリサンプリングで生成"""
     
     source_dir = os.path.join(output_dir, str(source_zoom))
@@ -341,18 +482,24 @@ def generate_pyramid_level(output_dir, target_zoom, source_zoom, tile_size):
     print(f"  Found {len(source_tiles)} source tiles at zoom {source_zoom}")
     
     # ターゲットズームレベルのタイル範囲を計算
-    target_tiles = set()
-    for source_tx, source_ty in source_tiles:
-        # 親タイルから子タイルの座標を計算
-        target_tx = source_tx // 2
-        target_ty = source_ty // 2
-        target_tiles.add((target_tx, target_ty))
+    if target_tiles and target_zoom in target_tiles:
+        # CSVで指定されたタイルのみを対象とする
+        target_tiles_coords = target_tiles[target_zoom]
+        print(f"  Using target tiles from CSV: {len(target_tiles_coords)} tiles at zoom {target_zoom}")
+    else:
+        # ソースタイルから計算
+        target_tiles_coords = set()
+        for source_tx, source_ty in source_tiles:
+            # 親タイルから子タイルの座標を計算
+            target_tx = source_tx // 2
+            target_ty = source_ty // 2
+            target_tiles_coords.add((target_tx, target_ty))
     
-    print(f"  Generating {len(target_tiles)} target tiles at zoom {target_zoom}")
+    print(f"  Generating {len(target_tiles_coords)} target tiles at zoom {target_zoom}")
     
     generated_count = 0
     
-    for target_tx, target_ty in target_tiles:
+    for target_tx, target_ty in target_tiles_coords:
         # 4つの親タイルの座標
         parent_tiles_coords = [
             (target_tx * 2, target_ty * 2),        # 左上
@@ -393,8 +540,10 @@ def generate_pyramid_level(output_dir, target_zoom, source_zoom, tile_size):
     return generated_count
 
 if __name__ == "__main__":
-    if len(sys.argv) != 6:
-        print("Usage: python3 generate_text_tiles.py <input_file> <output_dir> <min_zoom> <max_zoom> <tile_size>")
+    if len(sys.argv) < 6 or len(sys.argv) > 8:
+        print("Usage: python3 generate_text_tiles.py <input_file> <output_dir> <min_zoom> <max_zoom> <tile_size> [num_processes] [target_tiles_csv]")
+        print("  num_processes: Number of parallel processes (default: auto-detect, max 8)")
+        print("  target_tiles_csv: CSV file with target tile IDs (z,x,y format)")
         sys.exit(1)
     
     input_file = sys.argv[1]
@@ -403,6 +552,25 @@ if __name__ == "__main__":
     max_zoom = int(sys.argv[4])
     tile_size = int(sys.argv[5])
     
-    success = generate_text_tiles(input_file, output_dir, min_zoom, max_zoom, tile_size)
+    num_processes = None
+    if len(sys.argv) >= 7:
+        try:
+            num_processes = int(sys.argv[6])
+            if num_processes <= 0:
+                print("Error: num_processes must be positive")
+                sys.exit(1)
+        except ValueError:
+            # 6番目の引数がCSVファイルの場合
+            target_tiles_csv = sys.argv[6]
+            num_processes = None
+    
+    target_tiles_csv = None
+    if len(sys.argv) == 8:
+        target_tiles_csv = sys.argv[7]
+    elif len(sys.argv) == 7 and not sys.argv[6].isdigit():
+        target_tiles_csv = sys.argv[6]
+        num_processes = None
+    
+    success = generate_text_tiles(input_file, output_dir, min_zoom, max_zoom, tile_size, num_processes, target_tiles_csv)
     if not success:
         sys.exit(1)
