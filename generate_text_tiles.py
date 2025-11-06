@@ -300,6 +300,10 @@ def generate_base_zoom_tiles(dataset, band, geotransform, nodata_value,
             # NaNを0に変換
             elevation_grid = np.where(np.isnan(elevation_grid), 0.0, elevation_grid)
             
+            # 全面0.00の場合はタイル出力をスキップ
+            if np.all(elevation_grid == 0.0):
+                continue
+            
             # テキストファイルに保存
             tile_file = os.path.join(x_dir, f"{ty}.txt")
             save_tile_data(elevation_grid, tile_file)
@@ -374,6 +378,10 @@ def generate_pyramid_level(output_dir, target_zoom, source_zoom, tile_size):
         if len(parent_tiles) == 4:
             # ダウンサンプリング実行
             downsampled = downsample_tile(parent_tiles, tile_size)
+            
+            # 全面0.00の場合はタイル出力をスキップ
+            if np.all(downsampled == 0.0):
+                continue
             
             # ターゲットタイルを保存
             target_x_dir = os.path.join(target_dir, str(target_tx))
