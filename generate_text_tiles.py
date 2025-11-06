@@ -29,6 +29,54 @@ def num2deg(xtile, ytile, zoom):
     lat_deg = math.degrees(lat_rad)
     return (lat_deg, lon_deg)
 
+def bilinear_interpolation(data, x, y, width, height):
+    """バイリニア補間で標高値を取得"""
+    # 座標の整数部分と小数部分を取得
+    x1 = int(np.floor(x))
+    y1 = int(np.floor(y))
+    x2 = min(x1 + 1, width - 1)
+    y2 = min(y1 + 1, height - 1)
+    
+    # 範囲チェック
+    if x1 < 0 or y1 < 0 or x1 >= width or y1 >= height:
+        return np.nan
+    
+    # 小数部分
+    dx = x - x1
+    dy = y - y1
+    
+    # 4つの角の値を取得
+    try:
+        v11 = data[y1, x1]  # 左上
+        v21 = data[y1, x2]  # 右上
+        v12 = data[y2, x1]  # 左下
+        v22 = data[y2, x2]  # 右下
+        
+        # NaNチェック
+        if np.isnan(v11) or np.isnan(v21) or np.isnan(v12) or np.isnan(v22):
+            # 一部でもNaNがある場合は最近傍を使用
+            if dx < 0.5 and dy < 0.5:
+                return v11
+            elif dx >= 0.5 and dy < 0.5:
+                return v21
+            elif dx < 0.5 and dy >= 0.5:
+                return v12
+            else:
+                return v22
+        
+        # バイリニア補間を実行
+        # 上辺の補間
+        v_top = v11 * (1 - dx) + v21 * dx
+        # 下辺の補間
+        v_bottom = v12 * (1 - dx) + v22 * dx
+        # 縦方向の補間
+        result = v_top * (1 - dy) + v_bottom * dy
+        
+        return result
+        
+    except IndexError:
+        return np.nan
+
 def load_tile_data(tile_file):
     """タイルファイルからデータを読み込み"""
     if not os.path.exists(tile_file):
@@ -240,14 +288,14 @@ def generate_base_zoom_tiles(dataset, band, geotransform, nodata_value,
                     if (pixel_minx <= raster_x < pixel_maxx and 
                         pixel_miny <= raster_y < pixel_maxy):
                         
-                        # ローカル座標に変換
-                        local_x = int(raster_x - pixel_minx)
-                        local_y = int(raster_y - pixel_miny)
+                        # ローカル座標に変換（bilinear補間用）
+                        local_x = raster_x - pixel_minx
+                        local_y = raster_y - pixel_miny
                         
-                        if (0 <= local_x < width and 0 <= local_y < height):
-                            value = data[local_y, local_x]
-                            if not np.isnan(value):
-                                elevation_grid[i, j] = value
+                        # Bilinear補間を実行
+                        value = bilinear_interpolation(data, local_x, local_y, width, height)
+                        if not np.isnan(value):
+                            elevation_grid[i, j] = value
             
             # NaNを0に変換
             elevation_grid = np.where(np.isnan(elevation_grid), 0.0, elevation_grid)
