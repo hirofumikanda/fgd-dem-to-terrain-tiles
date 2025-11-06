@@ -376,28 +376,32 @@ def generate_base_zoom_tiles(dataset, band, geotransform, nodata_value,
     
     print(f"  Using {num_processes} processes for parallel tile generation")
     
-    # 対象タイルが指定されている場合はそれを使用
+    # このズームレベルでのタイル範囲を計算（常に実行）
+    min_tile_x, max_tile_y = deg2num(min_lat, min_lon, zoom)
+    max_tile_x, min_tile_y = deg2num(max_lat, max_lon, zoom)
+    
+    # タイル範囲を調整
+    min_tile_x = max(0, min_tile_x)
+    max_tile_x = min(2**zoom - 1, max_tile_x)
+    min_tile_y = max(0, min_tile_y)
+    max_tile_y = min(2**zoom - 1, max_tile_y)
+    
+    print(f"  Tile range: x={min_tile_x}-{max_tile_x}, y={min_tile_y}-{max_tile_y}")
+    
+    # ラスタ範囲内の全タイル座標のリストを生成
+    raster_tile_coords = []
+    for tx in range(min_tile_x, max_tile_x + 1):
+        for ty in range(min_tile_y, max_tile_y + 1):
+            raster_tile_coords.append((tx, ty))
+    
+    # 対象タイルが指定されている場合は交集合を取る
     if target_tiles and zoom in target_tiles:
-        tile_coords = list(target_tiles[zoom])
-        print(f"  Using target tiles from CSV: {len(tile_coords)} tiles at zoom {zoom}")
+        target_tile_set = target_tiles[zoom]
+        tile_coords = [(tx, ty) for tx, ty in raster_tile_coords if (tx, ty) in target_tile_set]
+        print(f"  Raster tiles: {len(raster_tile_coords)}, Target tiles: {len(target_tile_set)}, Intersection: {len(tile_coords)} tiles")
     else:
-        # このズームレベルでのタイル範囲を計算
-        min_tile_x, max_tile_y = deg2num(min_lat, min_lon, zoom)
-        max_tile_x, min_tile_y = deg2num(max_lat, max_lon, zoom)
-        
-        # タイル範囲を調整
-        min_tile_x = max(0, min_tile_x)
-        max_tile_x = min(2**zoom - 1, max_tile_x)
-        min_tile_y = max(0, min_tile_y)
-        max_tile_y = min(2**zoom - 1, max_tile_y)
-        
-        print(f"  Tile range: x={min_tile_x}-{max_tile_x}, y={min_tile_y}-{max_tile_y}")
-        
-        # 全タイル座標のリストを生成
-        tile_coords = []
-        for tx in range(min_tile_x, max_tile_x + 1):
-            for ty in range(min_tile_y, max_tile_y + 1):
-                tile_coords.append((tx, ty))
+        tile_coords = raster_tile_coords
+        print(f"  Processing all {len(tile_coords)} tiles in raster range")
     
     zoom_dir = os.path.join(output_dir, str(zoom))
     os.makedirs(zoom_dir, exist_ok=True)
