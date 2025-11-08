@@ -76,8 +76,11 @@ mkdir fgd
 #### 全パイプライン実行
 
 ```bash
-# Terrain RGBタイル生成
+# Terrain RGBタイル生成（直接変換）
 ./run_pipeline_terrain_rgb.sh
+
+# Terrain RGBタイル生成（標高テキストタイル経由）
+./run_pipeline_terrain_rgb_using_dem_text.sh
 
 # Hillshadeラスタタイル生成
 ./run_pipeline_hillshade.sh
@@ -96,7 +99,7 @@ mkdir fgd
 ./run_pipeline_terrain_rgb.sh --check
 ```
 
-### 処理ステップ
+### 処理ステップ（標準パイプライン）
 
 | ステップ | 処理内容 | 出力 |
 |---------|---------|------|
@@ -106,6 +109,37 @@ mkdir fgd
 | 4 | 統合・Web Mercator投影変換 | `dem_3857.tif` |
 | 5 | 形式別変換（Terrain RGB/Hillshade/等高線） | 各形式ファイル |
 | 6 | タイル生成・複数形式出力 | ラスタタイル + MBTiles + PMTiles |
+
+### 処理ステップ（標高テキストタイル経由パイプライン）
+
+| ステップ | 処理内容 | 出力 |
+|---------|---------|------|
+| 1 | DEM10B ZIP解凍・XML抽出 | `./xml/` |
+| 2 | XMLデータ補完処理 | 補完済みXML |
+| 3 | GeoTIFF変換 | `./tiff/` |
+| 4 | 統合・Web Mercator投影変換 | `dem_3857.tif` |
+| 5 | 標高テキストタイル生成 | `./tiles_elevation/` |
+| 6 | テキストタイルからTerrain RGBタイル変換 | ラスタタイル + MBTiles + PMTiles |
+
+## 標高テキストタイル経由パイプライン
+
+### 概要
+
+`run_pipeline_terrain_rgb_using_dem_text.sh` は、直接Terrain RGB変換とは異なるアプローチで、一度標高データをテキストタイル形式に変換してからTerrain RGBタイルを生成します。
+
+### 特徴・利点
+
+- 事前にbilinearでリサンプリングした標高値テキストタイルを用いることで、隣り合う標高値を平滑化（nearest neighborで生じるズレを回避）
+- テキストタイル経由により処理時間が長くなるため、処理のマルチプロセス化及び、日本国土が存在するタイルのみに処理を限定することで処理時間を短縮
+
+### 処理の流れ
+
+```
+DEM GeoTIFF → 標高テキストタイル生成 → Terrain RGB PNG変換 → MBTiles/PMTiles出力
+    ↓               ↓                      ↓
+dem_3857.tif    ./tiles_elevation/    ./tiles_terrainrgb/
+                   (*.txt)              (*.png)
+```
 
 ## 設定
 
@@ -148,9 +182,11 @@ LAYER_NAME="contour"
 ### 主要な中間ファイル
 
 - `dem_3857.tif` - Web Mercator投影変換済みDEM
+- `dem_3857_cleaned.tif` - nodata値を0に変換したDEM（Terrain RGB用）
 - `dem_3857_terrainrgb.tif` - Terrain RGBエンコード済み
 - `dem_3857_hillshade.tif` - Hillshade画像
 - `dem_3857_contour.geojson` - 等高線（GeoJSONSeq形式）
+- `tiles_elevation/` - 標高値テキストタイル（*.txt）
 
 ### 最終出力
 
