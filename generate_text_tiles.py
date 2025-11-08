@@ -5,7 +5,6 @@ import math
 import numpy as np
 from scipy import ndimage
 from multiprocessing import Pool, cpu_count
-from functools import partial
 import time
 import csv
 
